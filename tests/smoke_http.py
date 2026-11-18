@@ -133,6 +133,70 @@ openapi = json.loads(u.urlopen(BASE + "/openapi.json", timeout=5).read().decode(
 check("/docs可访问", docs == 200)
 check("openapi路径齐全", {"/batches", "/changes", "/outlets", "/stats", "/health"}.issubset(openapi["paths"].keys()))
 
+# 13. 截止序号基线：首批截止 100，101 号变更不得误报缺 1~100（缺陷回归场景）
+s, b = call("POST", "/batches", {"total_shards": 1, "source_cutoff_seq": 100})
+check("截止100开批", s == 201)
+bid4 = b["batch_id"]
+call("POST", f"/batches/{bid4}/shards", {"shard_no": 1, "items": [
+    {"outlet_no": "N1", "district": "A", "active": True},
+    {"outlet_no": "N2", "district": "A", "active": True},
+]})
+s, b = call("POST", "/changes", {"seq": 101, "change_type": "move", "outlet_no": "N1", "district": "B"})
+# 现役 v2 尚无 N1（只存在于未发布快照）：变更被接收但成为链上断点，等待新快照发布时重放解除
+check("101号变更被接收（现役无此排口->阻断待重放）",
+      s == 201 and b["seq"] == 101 and b["applied"] is False and b["blocked"] is True
+      and b["effective_baseline"] == 100 and b["expected_next_seq"] == 102, str(b))
+s, b = call("POST", "/changes", {"seq": 103, "change_type": "deactivate", "outlet_no": "N2"})
+check("真实缺号只报102", s == 422 and b["code"] == "SEQ_GAP" and b["details"]["missing_seqs"] == [102])
+s, b = call("POST", "/changes", {"seq": 50, "change_type": "deactivate", "outlet_no": "N1"})
+check("快照覆盖序号拒绝补写", s == 409 and b["code"] == "SEQ_COVERED_BY_SNAPSHOT")
+s, b = call("GET", "/changes")
+check("缺号视图不含1~100", b["missing_seqs"] == [] and b["next_expected_seq"] == 102)
+
+# 14. 废弃后同截止序号重开：已接收变更（含阻断条目）保留，废弃不推进水位
+s, b = call("POST", f"/batches/{bid4}/abort")
+check("废弃批次", s == 200 and b["status"] == "aborted")
+s, b = call("GET", "/health")
+check("废弃不推进水位", b["version"] == 2 and b["last_served_seq"] == 4)
+s, b = call("POST", "/batches", {"total_shards": 1, "source_cutoff_seq": 100})
+check("同截止序号重开", s == 201)
+bid5 = b["batch_id"]
+call("POST", f"/batches/{bid5}/shards", {"shard_no": 1, "items": [
+    {"outlet_no": "N1", "district": "A", "active": True},
+    {"outlet_no": "N2", "district": "A", "active": True},
+]})
+s, b = call("GET", "/batches/current")
+check("重开后下一应收102、断点保留", b["next_expected_seq"] == 102 and b["blocked"] is True)
+# 追平到 101：窗口 (100,101] 只含 101，阻断在新快照上重放解除，发布成功；102 尚未要求
+s, b = call("POST", f"/batches/{bid5}/publish", {"catch_up_seq": 101})
+check("追平101发布成功并解除阻断", s == 200 and b["changes_applied"] == 1 and b["version"] == 3, str(b))
+# 再想追平到 102 但批次已关 -> 拒绝（NO_OPEN_BATCH）；下一周期重开补齐 102
+s, b = call("POST", f"/batches/{bid5}/publish", {"catch_up_seq": 102})
+check("已关闭批次不可再发布", s in (404, 409) and b["code"] == "NO_OPEN_BATCH")
+s, b = call("POST", "/batches", {"total_shards": 1, "source_cutoff_seq": 101})
+check("下一周期截止101开批", s == 201)
+bid6 = b["batch_id"]
+call("POST", f"/batches/{bid6}/shards", {"shard_no": 1, "items": [
+    {"outlet_no": "N1", "district": "B", "active": True},
+    {"outlet_no": "N2", "district": "A", "active": True},
+]})
+# 102 缺失时追平 102 -> 真实缺号门禁（只报 102，不含历史）
+s, b = call("POST", f"/batches/{bid6}/publish", {"catch_up_seq": 102})
+check("缺102拒绝发布", s == 422 and b["code"] == "CHANGE_SEQ_GAP" and b["details"]["missing_seqs"] == [102])
+# 补齐 102 后追平发布：102 纳入现役清单
+call("POST", "/changes", {"seq": 102, "change_type": "deactivate", "outlet_no": "N2"})
+s, b = call("POST", f"/batches/{bid6}/publish", {"catch_up_seq": 102})
+check("补齐后追平发布", s == 200 and b["changes_applied"] == 1 and b["version"] == 4, str(b))
+s, outlets = call("GET", "/outlets")
+omap2 = {o["outlet_no"]: o for o in outlets["items"]}
+check("阻断101迁区重放生效", omap2["N1"]["district"] == "B")
+check("102停用生效", omap2["N2"]["active"] is False)
+s, b = call("GET", "/health")
+check("水位推进到102", b["last_served_seq"] == 102)
+# 发布后增量按有效基线接续
+s, b = call("POST", "/changes", {"seq": 103, "change_type": "move", "outlet_no": "N1", "district": "C"})
+check("发布后增量103接续", s == 201 and b["applied"] is True and b["expected_next_seq"] == 104)
+
 failed = [n for n, ok, _ in log if not ok]
 print(f"\n==== 冒烟结果：{len(log) - len(failed)}/{len(log)} 通过 ====")
 if failed:

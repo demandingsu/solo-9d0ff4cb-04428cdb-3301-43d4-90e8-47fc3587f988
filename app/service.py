@@ -3,9 +3,13 @@
 关键不变量：
 1. 同一时刻只有一个 open 批次；已发布版本与暂存区物理隔离。
 2. 分片按 (batch_id, shard_no)、变更按 seq 做内容哈希幂等，同内容重试只生效一次，异内容冲突。
-3. 变更序号必须连续，缺口之后的变更拒绝写入；已供出水位 last_served_seq 单调不减。
-4. 发布在单事务内完成：建新版排口 -> 套用窗口变更 -> 续套水位外变更 -> 删旧版 -> 推进水位，
-   任一步失败整体回滚，旧版照常供数。
+3. 变更序号必须相对“有效基线”连续：有效基线取已供出水位 last_served_seq 与在传批次
+   来源截止序号 source_cutoff_seq 的较大值——全量快照已覆盖的历史序号不算缺口，
+   首个全量批次（截止 100）上传期间即可接收 seq=101 的变更。
+4. 尚无现役清单（version=0）时到达的变更一律接收并“暂挂”（applied=0，不标 blocked），
+   发布时在新快照上按窗口重放；blocked 只表示真实套用失败造成的链上断点。
+5. 发布在单事务内完成：建新版排口 -> 套用窗口变更 -> 续套水位外变更 -> 删旧版 -> 推进水位，
+   任一步失败整体回滚，旧版照常供数；废弃批次不会推进现役水位，已接收的变更仍可用于下批追平。
 """
 from __future__ import annotations
 
@@ -91,6 +95,26 @@ def _missing_between(conn: sqlite3.Connection, lo: int, hi: int) -> list[int]:
     return [s for s in range(lo + 1, hi + 1) if s not in existing]
 
 
+def _effective_baseline(conn: sqlite3.Connection, served_seq: int) -> int:
+    """变更链的有效连续性基线：已供出水位与在传批次来源截止序号的较大值。
+
+    - 已发布快照经 last_served_seq 覆盖的历史序号，不参与缺号计算；
+    - 首批全量（如截止序号 100）上传期间，快照声明覆盖 1..100，seq=101 即可作为
+      第一个变更被接收，不再误报“缺少 1..100”；
+    - 批次废弃后以相同截止序号重开，基线不变，此前已接收的变更仍可用于追平。
+    """
+    batch = _get_open_batch(conn)
+    cutoff = int(batch["source_cutoff_seq"]) if batch is not None else 0
+    return max(served_seq, cutoff)
+
+
+def _next_expected_seq(conn: sqlite3.Connection, served_seq: int) -> int:
+    """下一应收序号：有效基线之后，且越过已接收变更的连续前缀。"""
+    baseline = _effective_baseline(conn, served_seq)
+    max_seq = _max_change_seq(conn)
+    return max(baseline, max_seq) + 1
+
+
 # ---------- 变更套用 ----------
 
 def _apply_change_to_version(conn: sqlite3.Connection, version: int, ch: sqlite3.Row) -> Optional[str]:
@@ -127,8 +151,12 @@ def _run_change_chain(conn: sqlite3.Connection, version: int) -> None:
     """增量提交路径：对当前现役版本依次套用未应用且未阻断的变更。
 
     链上一旦存在 blocked 断点，其后的变更（即使序号连续）也保持未应用——不得越过断点；
-    失败的变更置 blocked。version=0（尚无发布版本）时所有待应用变更阻断，待首次发布时重放。
+    失败的变更置 blocked。version=0（尚无已发布清单，例如首批全量上传期间）时，
+    到达的变更一律“暂挂”（applied=0、blocked=0），待首次发布时在新快照上按窗口重放——
+    暂挂是正常的等待状态，不是链上断点，不得标记 blocked。
     """
+    if version == 0:
+        return
     first_blocked = conn.execute(
         "SELECT MIN(seq) AS m FROM change_log WHERE blocked=1"
     ).fetchone()["m"]
@@ -138,13 +166,6 @@ def _run_change_chain(conn: sqlite3.Connection, version: int) -> None:
     for ch in pending:
         if first_blocked is not None and ch["seq"] > first_blocked:
             break  # 断点之后的变更不得越过
-        if version == 0:
-            reason = "尚无已发布清单，变更暂挂，待首次发布后套用"
-            conn.execute(
-                "UPDATE change_log SET blocked=1, block_reason=? WHERE id=?",
-                (reason, ch["id"]),
-            )
-            break
         reason = _apply_change_to_version(conn, version, ch)
         if reason is not None:
             conn.execute(
@@ -378,11 +399,13 @@ def submit_change(req: ChangeRequest) -> dict:
                 "applied": bool(existing["applied"]),
                 "blocked": bool(existing["blocked"]),
                 "block_reason": existing["block_reason"],
-                "expected_next_seq": _max_change_seq(conn) + 1,
+                "held": not bool(existing["applied"]) and not bool(existing["blocked"]),
+                "expected_next_seq": _next_expected_seq(conn, served_seq),
+                "effective_baseline": _effective_baseline(conn, served_seq),
                 "last_served_seq": served_seq,
             }
 
-        # 序号规则：不能倒退到已供出水位之内（先于缺号判断，且只约束新序号）
+        # 序号规则：已供出水位之内的序号属已发布历史，不可补写（先于基线/缺号判断）
         if req.seq <= served_seq:
             raise ServiceError(
                 409,
@@ -391,15 +414,31 @@ def submit_change(req: ChangeRequest) -> dict:
                 {"last_served_seq": served_seq},
             )
 
-        # 序号规则：不能越过缺号
+        # 序号规则：有效基线之内的序号已被快照覆盖（全量快照自带 1..cutoff 的效果），
+        # 同样不算缺口、不可重复提交；首个全量批次截止 100 时，101 即下一应收序号。
+        baseline = _effective_baseline(conn, served_seq)
+        if req.seq <= baseline:
+            raise ServiceError(
+                409,
+                "SEQ_COVERED_BY_SNAPSHOT",
+                f"序号 {req.seq} 已被全量快照覆盖（有效基线={baseline}），不作为增量变更接收",
+                {"effective_baseline": baseline, "last_served_seq": served_seq},
+            )
+
+        # 序号规则：不能越过真实缺号——只统计有效基线之后尚未到达的序号
         max_seq = _max_change_seq(conn)
-        if req.seq > max_seq + 1:
-            missing = list(range(max_seq + 1, req.seq))
+        frontier = max(baseline, max_seq)
+        if req.seq > frontier + 1:
+            missing = list(range(frontier + 1, req.seq))
             raise ServiceError(
                 422,
                 "SEQ_GAP",
-                f"序号 {req.seq} 越过缺号，下一个应为 {max_seq + 1}",
-                {"missing_seqs": missing, "expected_next_seq": max_seq + 1},
+                f"序号 {req.seq} 越过缺号，下一个应为 {frontier + 1}",
+                {
+                    "missing_seqs": missing,
+                    "expected_next_seq": frontier + 1,
+                    "effective_baseline": baseline,
+                },
             )
 
         conn.execute(
@@ -414,7 +453,8 @@ def submit_change(req: ChangeRequest) -> dict:
                 h,
             ),
         )
-        # 全量上传期间变更同样到达：立刻尝试套用到现役（旧版）清单
+        # 全量上传期间变更同样到达：现役清单存在则立即套用；尚在首批上传（version=0）则暂挂，
+        # applied=0/blocked=0，发布时由窗口重放纳入现役清单。
         _run_change_chain(conn, version)
 
         row = conn.execute("SELECT * FROM change_log WHERE seq=?", (req.seq,)).fetchone()
@@ -424,7 +464,9 @@ def submit_change(req: ChangeRequest) -> dict:
             "applied": bool(row["applied"]),
             "blocked": bool(row["blocked"]),
             "block_reason": row["block_reason"],
-            "expected_next_seq": _max_change_seq(conn) + 1,
+            "held": not bool(row["applied"]) and not bool(row["blocked"]),
+            "expected_next_seq": _next_expected_seq(conn, served_seq),
+            "effective_baseline": baseline,
             "last_served_seq": served_seq,
         }
 
@@ -659,13 +701,19 @@ def current_batch_status() -> dict:
         missing = [s for s in range(1, batch["total_shards"] + 1) if s not in received]
 
         cutoff = int(batch["source_cutoff_seq"])
+        state = _get_state(conn)
+        served_seq = int(state["last_served_seq"])
+        baseline = _effective_baseline(conn, served_seq)
         max_seq = _max_change_seq(conn)
+        # 待补序号只统计快照截止之后、已到达最大序号之间真正缺失的序号
         pending = _missing_between(conn, cutoff, max_seq)
 
         block_row = conn.execute(
             "SELECT * FROM change_log WHERE blocked=1 ORDER BY seq LIMIT 1"
         ).fetchone()
-        state = _get_state(conn)
+        held_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM change_log WHERE applied=0 AND blocked=0"
+        ).fetchone()["c"]
         return {
             "batch_id": batch["id"],
             "status": batch["status"],
@@ -674,10 +722,12 @@ def current_batch_status() -> dict:
             "received_shards": received,
             "missing_shards": missing,
             "changes_pending": pending,
-            "next_expected_seq": max_seq + 1,
+            "next_expected_seq": max(baseline, max_seq) + 1,
+            "effective_baseline": baseline,
+            "held_change_count": int(held_count),
             "blocked": block_row is not None,
             "block_reason": block_row["block_reason"] if block_row else None,
-            "last_served_seq": int(state["last_served_seq"]),
+            "last_served_seq": served_seq,
         }
 
 
@@ -685,11 +735,17 @@ def list_changes(limit: int, offset: int) -> dict:
     with get_read_conn() as conn:
         max_seq = _max_change_seq(conn)
         state = _get_state(conn)
+        served_seq = int(state["last_served_seq"])
+        # 缺号只统计有效基线（已供出版本/在传快照覆盖点）之后的部分，
+        # 快照已覆盖的历史序号不再算作缺口。
+        baseline = _effective_baseline(conn, served_seq)
         existing = {
             r["seq"]
-            for r in conn.execute("SELECT seq FROM change_log WHERE seq <= ?", (max_seq,)).fetchall()
+            for r in conn.execute(
+                "SELECT seq FROM change_log WHERE seq > ? AND seq <= ?", (baseline, max_seq)
+            ).fetchall()
         }
-        missing = [s for s in range(1, max_seq + 1) if s not in existing]
+        missing = [s for s in range(baseline + 1, max_seq + 1) if s not in existing]
         rows = conn.execute(
             "SELECT * FROM change_log ORDER BY seq LIMIT ? OFFSET ?", (limit, offset)
         ).fetchall()
@@ -704,12 +760,14 @@ def list_changes(limit: int, offset: int) -> dict:
                     "applied": bool(r["applied"]),
                     "blocked": bool(r["blocked"]),
                     "block_reason": r["block_reason"],
+                    "held": not bool(r["applied"]) and not bool(r["blocked"]),
                 }
                 for r in rows
             ],
             "missing_seqs": missing,
-            "next_expected_seq": max_seq + 1,
-            "last_served_seq": int(state["last_served_seq"]),
+            "next_expected_seq": max(baseline, max_seq) + 1,
+            "effective_baseline": baseline,
+            "last_served_seq": served_seq,
         }
 
 

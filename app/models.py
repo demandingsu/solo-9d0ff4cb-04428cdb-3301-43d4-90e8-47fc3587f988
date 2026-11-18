@@ -62,7 +62,14 @@ class ChangeSubmitResponse(BaseModel):
     applied: bool = Field(description="是否已落到现役清单（旧版）")
     blocked: bool
     block_reason: Optional[str] = None
+    held: bool = Field(
+        default=False,
+        description="是否已接收并暂挂：首批全量发布前或等待追平的变更，发布窗口重放后纳入现役清单",
+    )
     expected_next_seq: int
+    effective_baseline: int = Field(
+        default=0, description="有效连续性基线=max(已供出水位, 在传批次来源截止序号)"
+    )
     last_served_seq: int
 
 
@@ -113,8 +120,12 @@ class BatchStatusResponse(BaseModel):
     source_cutoff_seq: int
     received_shards: list[int]
     missing_shards: list[int]
-    changes_pending: list[int] = Field(description="截止序号之后至追平目标之间待补的变更序号（按当前最大已知序号推断）")
+    changes_pending: list[int] = Field(description="截止序号之后至已到达最大序号之间真正待补的变更序号")
     next_expected_seq: int
+    effective_baseline: int = Field(
+        default=0, description="有效连续性基线=max(已供出水位, 在传批次来源截止序号)"
+    )
+    held_change_count: int = Field(default=0, description="已接收但尚未落到现役清单的暂挂变更条数")
     blocked: bool
     block_reason: Optional[str] = None
     last_served_seq: int
@@ -129,12 +140,14 @@ class ChangeOut(BaseModel):
     applied: bool
     blocked: bool
     block_reason: Optional[str]
+    held: bool = False
 
 
 class ChangeListResponse(BaseModel):
     items: list[ChangeOut]
     missing_seqs: list[int]
     next_expected_seq: int
+    effective_baseline: int = 0
     last_served_seq: int
 
 
